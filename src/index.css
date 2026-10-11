@@ -1,0 +1,174 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'Poppins', sans-serif;
+  background: #ffffff;
+  color: #1a1a1a;
+  overflow-x: hidden;
+}html { scroll-behavior: smooth; }
+
+.swiper-pagination-bullet-active { background: #1655c3 !important; }
+.swiper-button-next, .swiper-button-prev { color: #1655c3 !important; }
+
+/* Rich-text blog content (Tiptap output) — shared between the admin editor's
+   own editable area (RichTextEditor.jsx) and the public post page
+   (BlogPostPage.jsx) so what the admin sees while writing matches what
+   visitors see. Font-size/font-family/text-align come from inline styles
+   Tiptap already writes; everything else needed styling is here. */
+.blog-content p { margin-bottom: 1em; }
+.blog-content h2 { font-size: 1.5em; font-weight: 800; color: #1a1a1a; margin: 1em 0 0.5em; line-height: 1.3; }
+.blog-content ul, .blog-content ol { margin: 0 0 1em 1.4em; }
+.blog-content ul { list-style: disc; }
+.blog-content ol { list-style: decimal; }
+.blog-content li { margin-bottom: 0.35em; }
+.blog-content a { color: #1655c3; text-decoration: underline; text-underline-offset: 2px; }
+.blog-content a:hover { color: #123f8f; }
+.blog-content blockquote { border-left: 4px solid #64ac37; padding: 0.25em 0 0.25em 1em; margin: 1em 0; color: #4b5563; font-style: italic; }
+.blog-content img { max-width: 100%; border-radius: 12px; margin: 1em 0; display: block; }
+.blog-content strong { font-weight: 700; }
+.blog-content em { font-style: italic; }
+.blog-content u { text-decoration: underline; }
+/* Safety net for rich-text content pasted from elsewhere (e.g. a Word/Docs
+   table) that the editor toolbar itself never produces but the sanitizer
+   still allows through — without this, one wide pasted element can force
+   horizontal scroll on the whole article at mobile widths. */
+.blog-content { overflow-wrap: break-word; }
+.blog-content table { display: block; max-width: 100%; overflow-x: auto; }
+
+/* Rich-text Ambassador Letter body (Tiptap output) — shared between the
+   admin editor's editable area (LetterBodyRichEditor.jsx), the draggable
+   live-preview box (LetterPositionEditor.jsx), and the offscreen node
+   html2canvas rasterizes at generation time (ambassadorLetterGenerator.js)
+   so all three render the exact same thing. Line-height/text-align come
+   from inline styles the editor already writes. */
+.letter-body p { margin: 0 0 0.6em; }
+.letter-body p:last-child { margin-bottom: 0; }
+.letter-body ul { margin: 0 0 0.6em 1.4em; list-style: disc; }
+.letter-body li { margin-bottom: 0.25em; }
+.letter-body strong { font-weight: 700; }
+.letter-body em { font-style: italic; }
+.letter-body mark { background-color: #fef08a; border-radius: 2px; padding: 0 0.15em; }
+
+@layer utilities {
+  /* Blue → teal → green diagonal brand gradient (from Why MEDWEB card) */
+  .brand-gradient {
+    background-image: linear-gradient(135deg, #217bb4 0%, #468da6 35%, #51928c 55%, #7ab653 100%);
+  }
+  .brand-gradient-hover:hover {
+    background-image: linear-gradient(135deg, #1e6fa3 0%, #3f8196 35%, #498379 55%, #6fa84a 100%);
+  }
+  .text-gradient {
+    background: linear-gradient(135deg, #1655c3, #64ac37);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .card-hover {
+    transition: all 0.3s cubic-bezier(0.4,0,0.2,1);
+  }
+  .card-hover:hover {
+    transform: translateY(-6px);
+    box-shadow: 0 20px 40px rgba(22,85,195,0.15);
+  }
+  .btn-primary {
+    background: #1655c3;
+    color: white;
+    padding: 12px 28px;
+    border-radius: 50px;
+    font-weight: 600;
+    font-size: 0.95rem;
+    transition: all 0.3s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    border: none;
+  }
+  .btn-primary:hover {
+    background: #0f42a0;
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(22,85,195,0.35);
+  }
+  .btn-green {
+    background: #64ac37;
+    color: white;
+    padding: 12px 28px;
+    border-radius: 50px;
+    font-weight: 600;
+    font-size: 0.95rem;
+    transition: all 0.3s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    border: none;
+  }
+  .btn-green:hover {
+    background: #4f8c29;
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(100,172,55,0.35);
+  }
+  .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+  .scrollbar-hide::-webkit-scrollbar { display: none; }
+  /* Systemic bottom fade for any admin-uploaded photo used as a full-bleed
+     panel/background image (FounderMessage today, reusable anywhere else
+     that needs the same treatment) — soft fade at the bottom edge so the
+     photo blends into whatever sits below it, regardless of what image is
+     uploaded. Applied unconditionally, not hand-tuned per photo. */
+  .photo-fade-bottom {
+    -webkit-mask-image: linear-gradient(to bottom, black 70%, transparent 100%);
+    mask-image: linear-gradient(to bottom, black 70%, transparent 100%);
+  }
+  @keyframes marquee-up {
+    from { transform: translateY(0); }
+    to   { transform: translateY(-50%); }
+  }
+  .animate-marquee-up { animation: marquee-up linear infinite; }
+  @keyframes marquee-x {
+    from { transform: translateX(0); }
+    to   { transform: translateX(-50%); }
+  }
+  .animate-marquee-x { animation: marquee-x linear infinite; }
+  /* Pause-on-hover only makes sense on devices with a real pointer — bound to
+     (hover: hover) so a tap on a touch screen (which has no "leave" event)
+     can't leave the marquee stuck paused forever. Without this guard,
+     touching a marquee once (e.g. Testimonials on mobile) silently killed
+     its auto-scroll for the rest of the visit. */
+  @media (hover: hover) {
+    .marquee-pause-hover:hover .animate-marquee-up { animation-play-state: paused; }
+    .marquee-pause-hover:hover .animate-marquee-x { animation-play-state: paused; }
+  }
+  .section-padding { padding: 80px 0; }
+  .section-title {
+    font-size: 2.2rem;
+    font-weight: 700;
+    color: #1a1a1a;
+    line-height: 1.2;
+  }
+  @media (max-width: 768px) {
+    .section-title { font-size: 1.7rem; }
+    .section-padding { padding: 60px 0; }
+  }
+  /* Subtle fade-in when an admin page mounts (page switch or first load) */
+  @keyframes page-fade-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .animate-page-fade-in { animation: page-fade-in 0.25s ease-out; }
+
+  /* Blue-to-green neon glow for "Upcoming" webinar cards only — the
+     gradient ring comes from the wrapper's background showing through a
+     thin padding gap (see .webinar-neon-border usage in WebinarsSlider),
+     this class just handles the pulsing outer glow. */
+  @keyframes webinar-neon-pulse {
+    0%, 100% { box-shadow: 0 0 8px 1px rgba(22,85,195,0.45), 0 0 16px 3px rgba(100,172,55,0.3); }
+    50%      { box-shadow: 0 0 14px 3px rgba(22,85,195,0.65), 0 0 26px 6px rgba(100,172,55,0.5); }
+  }
+  .webinar-neon-border {
+    background: linear-gradient(135deg, #1655c3, #64ac37);
+    animation: webinar-neon-pulse 2.4s ease-in-out infinite;
+  }
+}

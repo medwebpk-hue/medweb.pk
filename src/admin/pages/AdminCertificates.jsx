@@ -1,0 +1,820 @@
+import { useState, useEffect, useMemo } from 'react'
+import * as XLSX from 'xlsx'
+import jsPDF from 'jspdf'
+import { Award, CheckCircle, XCircle, Eye, Edit2, Download, Copy, ExternalLink, FileText, Plus, X, Folder, ArrowLeft, FileSpreadsheet, FileType } from 'lucide-react'
+import StatCard   from '../components/StatCard'
+import DataTable  from '../components/DataTable'
+import FolderGrid from '../components/FolderGrid'
+import Modal      from '../components/Modal'
+import FormField, { inputCls } from '../components/FormField'
+import ImageUpload from '../components/ImageUpload'
+import CertPositionEditor from '../components/CertPositionEditor'
+import CertificateTemplate, { TEMPLATES } from '../../components/CertificateTemplate'
+import AdminButton from '../components/AdminButton'
+import ResponsesModal from '../components/ResponsesModal'
+import { certificatesService, webinarsService, coursesService, formsService, settingsService } from '../../firebase/services'
+import { issueManualCertificate } from '../../lib/certificateGenerator'
+import { DEFAULT_CERT_FONT } from '../../constants/certificateFonts'
+
+// Groups the flat certificate list into "folders" by whatever already links
+// a certificate to its source: webinarId (auto-issued from a webinar's
+// feedback flow) takes priority, then sourceId+sourceType for
+// webinar/course records edited/created through the legacy source picker,
+// falling back to one shared "Manual / Other" folder for certificates with
+// no linkable source at all (issueManualCertificate's plain manual issuance).
+function folderKeyFor(cert) {
+  if (cert.webinarId) return `webinar:${cert.webinarId}`
+  if (cert.sourceId && (cert.sourceType === 'webinar' || cert.sourceType === 'course')) return `${cert.sourceType}:${cert.sourceId}`
+  return 'unassigned'
+}
+function folderLabelFor(cert) {
+  if (cert.webinarTitle) return cert.webinarTitle
+  if (cert.sourceType && cert.sourceType !== 'manual' && cert.title) return cert.title
+  return 'Manual / Other Certificates'
+}
+
+// Real feedback answers only — a certificate without a submissionId (manual
+// issuance, or an older record from before this field existed) simply
+// contributes no feedback columns, never a fabricated one. `subs`/`forms`
+// are the same already-loaded lists ResponsesModal uses for the single-cert
+// "View Submission" action, just applied across a whole folder at once.
+function buildFeedbackColumns(certs, subs, forms) {
+  const subMap = new Map(subs.map(s => [s.id, s]))
+  const labelByKey = new Map() // field key -> label, first-seen order
+  const perCert = new Map()    // cert.id -> { key: displayValue }
+  for (const c of certs) {
+    if (!c.submissionId) continue
+    const sub = subMap.get(c.submissionId)
+    if (!sub) continue
+    const form = forms.find(f => f.id === sub.formId)
+    const answers = {}
+    for (const [key, value] of Object.entries(sub.values || {})) {
+      if (key.endsWith('__uploading')) continue
+      if (!labelByKey.has(key)) labelByKey.set(key, form?.fields?.find(f => f.key === key)?.label || key)
+      answers[key] = Array.isArray(value) ? value.join(', ') : String(value ?? '')
+    }
+    perCert.set(c.id, answers)
+  }
+  return { keys: Array.from(labelByKey.keys()), labelByKey, perCert }
+}
+
+const genCode = () => `CERT-MW-${new Date().getFullYear()}-${Math.random().toString(36).substring(2,7).toUpperCase()}`
+
+// Manual "Issue Certificate" — rebuilt to match the automatic
+// webinar-feedback flow exactly (template image + drag-to-position editor
+// + font picker, see CertPositionEditor), instead of the old
+// design-picker/signatory form below (kept only for editing legacy
+// records that don't have a certificateImageUrl).
+const emptyRecipient = () => ({ id: crypto.randomUUID(), name: '', email: '', phone: '' })
+
+const emptyIssueForm = () => ({
+  imageUrl: '', namePos: null, idPos: null,
+  recipients: [emptyRecipient()], description: '',
+  customFields: [], elements: [],
+})
+
+const emptyForm = () => ({
+  certCode: genCode(),
+  template: 'classic',
+  recipient: '',
+  recipientEmail: '',
+  sourceType: 'manual',   // 'webinar' | 'course' | 'manual'
+  sourceId: '',
+  title: '',
+  body: 'has demonstrated outstanding commitment to medical excellence.',
+  issued: new Date().toISOString().split('T')[0],
+  signatoryName: 'Dr. Shahroz Abbas',
+  signatoryTitle: 'Founder & CEO, MEDWEB-PK',
+  status: 'Valid',
+  verifications: 0,
+})
+
+// scale helper for the live preview (cert is 1000x707). An auto-generated
+// webinar certificate is a real composited image (certificateImageUrl) —
+// showing it here instead of always falling back to the generic
+// CertificateTemplate design is what makes this match the actual uploaded
+// template (background, signatures, layout) rather than a plain default.
+// Mirrors the exact same branching CertificatePage.jsx already uses for the
+// public verification view.
+function PreviewBox({ form, scale = 0.46 }) {
+  if (form.certificateImageUrl) {
+    return (
+      <img
+        src={form.certificateImageUrl}
+        alt={`Certificate ${form.certCode || ''}`}
+        style={{ width: 1000 * scale, height: 'auto', display: 'block', borderRadius: 8 }}
+      />
+    )
+  }
+  return (
+    <div style={{ width: 1000 * scale, height: 707 * scale, overflow: 'hidden' }}>
+      <div style={{ transform: `scale(${scale})`, transformOrigin: 'top left' }}>
+        <CertificateTemplate {...form} />
+      </div>
+    </div>
+  )
+}
+
+export default function AdminCertificates() {
+  const [data,    setData]    = useState([])
+  const [webinars,setWebinars]= useState([])
+  const [courses, setCourses] = useState([])
+  const [forms,   setForms]   = useState([])
+  const [subs,    setSubs]    = useState([])
+  const [loading, setLoading] = useState(true)
+  const [modal,   setModal]   = useState(false)        // 'edit' only now — 'add' replaced by issueModal below
+  const [form,    setForm]    = useState(emptyForm)
+  const [editId,  setEditId]  = useState(null)
+  const [saving,  setSaving]  = useState(false)
+  const [issueModal, setIssueModal] = useState(false)
+  const [issueForm,  setIssueForm]  = useState(emptyIssueForm)
+  const [issueSaving, setIssueSaving] = useState(false)
+  const [issueProgress, setIssueProgress] = useState(null) // { done, total } while a batch is issuing
+  const [focusedRecipientId, setFocusedRecipientId] = useState(null) // drives the Name box's live preview text
+  const [preview, setPreview] = useState(null)         // cert row for full preview modal
+  const [viewSubCert, setViewSubCert] = useState(null) // cert row whose submission is being viewed
+  const [verifyCode,   setVerifyCode]   = useState('')
+  const [verifyResult, setVerifyResult] = useState(null)
+  const [verifying,    setVerifying]    = useState(false)
+  // The last template (image + Name/ID/custom-field positions & fonts) the
+  // admin actually issued a certificate with — so re-opening "Issue
+  // Certificate" for the next recipient doesn't force a re-upload every
+  // time. Persisted on settings/site, so it also carries across sessions.
+  const [lastTemplate, setLastTemplate] = useState(null)
+  // Folder view — null = showing the folder grid; a key = showing that
+  // folder's own certificate list.
+  const [activeFolderKey, setActiveFolderKey] = useState(null)
+
+  useEffect(() => {
+    const u1 = certificatesService.listen(rows => { setData(rows); setLoading(false) })
+    const u2 = webinarsService.listen(rows => setWebinars(rows))
+    const u3 = coursesService.listen(rows => setCourses(rows))
+    const u4 = formsService.listen(rows => setForms(rows))
+    const u5 = formsService.listenSubmissions(rows => setSubs(rows))
+    return () => { u1(); u2(); u3(); u4(); u5() }
+  }, [])
+
+  useEffect(() => {
+    settingsService.get().then(s => { if (s?.lastManualCertTemplate) setLastTemplate(s.lastManualCertTemplate) }).catch(() => {})
+  }, [])
+
+  // One entry per webinar/course/manual-bucket — sorted most-recently-active
+  // first (by the latest issue date inside it) so the folders an admin
+  // actually cares about right now surface at the top.
+  const folders = useMemo(() => {
+    const map = new Map()
+    for (const c of data) {
+      const key = folderKeyFor(c)
+      if (!map.has(key)) map.set(key, { key, label: folderLabelFor(c), certs: [], latestIssued: '' })
+      const f = map.get(key)
+      f.certs.push(c)
+      if (c.issued && c.issued > f.latestIssued) f.latestIssued = c.issued
+    }
+    return Array.from(map.values()).sort((a, b) => b.latestIssued.localeCompare(a.latestIssued))
+  }, [data])
+  const activeFolder = folders.find(f => f.key === activeFolderKey) || null
+
+  // The webinar this folder is actually for (only "webinar:*" folders have
+  // one — "course:*" and "unassigned" don't carry a per-session template).
+  // Re-derived from activeFolder/webinars every render, so it's always
+  // whichever folder is currently open — never stale, never shared between
+  // folders. Its own certTemplate (already uploaded per-webinar in Admin >
+  // Webinars > Certificate Template) is the SAME field the automatic
+  // webinar-feedback flow reads — reused here rather than duplicated.
+  const activeFolderWebinar = useMemo(() => {
+    if (!activeFolder || !activeFolder.key.startsWith('webinar:')) return null
+    const webinarId = activeFolder.certs[0]?.webinarId
+    return webinarId ? webinars.find(w => w.id === webinarId) || null : null
+  }, [activeFolder, webinars])
+
+  const exportFolderExcel = (folder) => {
+    const { keys, labelByKey, perCert } = buildFeedbackColumns(folder.certs, subs, forms)
+    const rows = folder.certs.map(c => ({
+      'Recipient': c.recipient || c.student || '',
+      'Email': c.recipientEmail || c.email || '',
+      'Certificate ID': c.certCode || '',
+      'Issued': c.issued || '',
+      'Status': c.status || '',
+      ...Object.fromEntries(keys.map(k => [labelByKey.get(k), perCert.get(c.id)?.[k] || ''])),
+    }))
+    const ws = XLSX.utils.json_to_sheet(rows)
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, ws, 'Certificates')
+    const safeName = folder.label.replace(/[^a-z0-9]+/gi, '_').slice(0, 40)
+    XLSX.writeFile(wb, `MEDWEB_${safeName}_Certificates.xlsx`)
+  }
+
+  const exportFolderPdf = (folder) => {
+    const { keys, labelByKey, perCert } = buildFeedbackColumns(folder.certs, subs, forms)
+    const shownKeys = keys.slice(0, 3)
+    const extraCount = keys.length - shownKeys.length
+    const headers = ['Recipient', 'Email', 'Certificate ID', 'Issued', ...shownKeys.map(k => labelByKey.get(k))]
+
+    const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' })
+    const marginX = 30
+    const pageWidth = doc.internal.pageSize.getWidth()
+    const pageHeight = doc.internal.pageSize.getHeight()
+    const colWidth = (pageWidth - marginX * 2) / headers.length
+    let y = 50
+
+    doc.setFontSize(14)
+    doc.setFont(undefined, 'bold')
+    doc.text(`${folder.label} — Certificates`, marginX, 30)
+
+    const drawHeader = () => {
+      doc.setFillColor(22, 85, 195)
+      doc.rect(marginX, y - 12, pageWidth - marginX * 2, 18, 'F')
+      doc.setTextColor(255, 255, 255)
+      doc.setFontSize(9)
+      doc.setFont(undefined, 'bold')
+      headers.forEach((h, i) => doc.text(String(h), marginX + i * colWidth + 4, y))
+      doc.setTextColor(30, 30, 30)
+      doc.setFont(undefined, 'normal')
+      y += 16
+    }
+    drawHeader()
+
+    folder.certs.forEach(c => {
+      if (y > pageHeight - 30) { doc.addPage(); y = 40; drawHeader() }
+      const answers = perCert.get(c.id) || {}
+      const rowVals = [
+        c.recipient || c.student || '', c.recipientEmail || c.email || '',
+        c.certCode || '', c.issued || '',
+        ...shownKeys.map(k => answers[k] || ''),
+      ]
+      rowVals.forEach((v, i) => {
+        const text = doc.splitTextToSize(String(v), colWidth - 6)[0] || ''
+        doc.text(text, marginX + i * colWidth + 4, y)
+      })
+      y += 16
+    })
+
+    if (extraCount > 0) {
+      y += 10
+      doc.setFontSize(8)
+      doc.setTextColor(120, 120, 120)
+      doc.text(`+ ${extraCount} more feedback question${extraCount > 1 ? 's' : ''} — see the Excel export for the full set of answers.`, marginX, y)
+    }
+
+    const safeName = folder.label.replace(/[^a-z0-9]+/gi, '_').slice(0, 40)
+    doc.save(`MEDWEB_${safeName}_Certificates.pdf`)
+  }
+
+  // The submission a certificate was auto-issued from, plus the form that
+  // defines its field labels (for ResponsesModal, reused as-is from Form
+  // Builder — passed a single-item `subs` array to show just this one).
+  const viewSubData = (() => {
+    if (!viewSubCert?.submissionId) return null
+    const sub = subs.find(s => s.id === viewSubCert.submissionId)
+    if (!sub) return null
+    const parentForm = forms.find(f => f.id === sub.formId) || { title: viewSubCert.title || 'Submission', fields: [] }
+    return { sub, parentForm }
+  })()
+
+  const openEdit = row => { setForm({ ...emptyForm(), ...row }); setEditId(row.id); setModal('edit') }
+  const closeModal = () => { setModal(false); setEditId(null) }
+  const set = field => e => setForm(p => ({ ...p, [field]: e.target.value }))
+
+  // --- Manual "Issue Certificate" (rebuilt to match the automatic flow) ---
+  // Folder-aware: opened from inside a webinar's own folder, this pre-fills
+  // THAT webinar's own certTemplate (image/positions/fonts) and a
+  // description mentioning its title — the admin only has to fill in
+  // recipient details. Opened at the top level (no folder, or a
+  // course/manual folder with no template of its own), it falls back to
+  // the last-used generic template exactly as before — this is what keeps
+  // #4 of the request true: top-level issuance is unchanged.
+  const openIssue = () => {
+    const sessionTemplate = activeFolderWebinar?.certTemplate?.imageUrl ? activeFolderWebinar.certTemplate : null
+    const base = sessionTemplate || lastTemplate
+    const next = base ? {
+      ...emptyIssueForm(),
+      imageUrl: base.imageUrl || '',
+      namePos: base.namePos || null,
+      idPos: base.idPos || null,
+      customFields: (base.customFields || []).map(f => ({ ...f, value: '' })),
+      elements: base.elements || [],
+    } : emptyIssueForm()
+    if (activeFolderWebinar) {
+      next.description = `For successfully completing "${activeFolderWebinar.topic || activeFolderWebinar.title || activeFolder.label}"`
+    }
+    setIssueForm(next)
+    setFocusedRecipientId(next.recipients[0].id)
+    setIssueModal(true)
+  }
+  const closeIssue = () => setIssueModal(false)
+  const setIssueField = field => e => setIssueForm(p => ({ ...p, [field]: e.target.value }))
+
+  // Recipients — a repeatable list so one template/description/custom-field
+  // set can be issued to many people in one go, each still getting their
+  // own distinct certificate ID (generated per-recipient below).
+  // `focusedRecipientId` drives the Name box's live preview in
+  // CertPositionEditor — only the actively-edited row needs to preview live.
+  const addRecipient = () => setIssueForm(p => {
+    const row = emptyRecipient()
+    setFocusedRecipientId(row.id)
+    return { ...p, recipients: [...p.recipients, row] }
+  })
+  const removeRecipient = id => setIssueForm(p => ({ ...p, recipients: p.recipients.filter(r => r.id !== id) }))
+  const setRecipientField = (id, key) => e => setIssueForm(p => ({
+    ...p,
+    recipients: p.recipients.map(r => r.id === id ? { ...r, [key]: e.target.value } : r),
+  }))
+  const activeRecipientName = issueForm.recipients.find(r => r.id === focusedRecipientId)?.name
+    || issueForm.recipients[0]?.name || ''
+
+  // Loops issueManualCertificate() once per recipient — each call is its
+  // own composite/upload/record/email pass with its own generated cert
+  // code, exactly like the single-recipient flow, just repeated. A failure
+  // on one recipient is caught and recorded, not thrown — the rest of the
+  // batch keeps going, and the admin sees a full success/failure summary
+  // at the end rather than a silent partial batch.
+  const handleIssueSave = async () => {
+    const validRecipients = issueForm.recipients.filter(r => r.name.trim() && r.email.trim())
+    if (validRecipients.length === 0) { alert('Add at least one recipient with a name and email'); return }
+
+    setIssueSaving(true)
+    setIssueProgress({ done: 0, total: validRecipients.length })
+    const results = []
+    for (const r of validRecipients) {
+      try {
+        await issueManualCertificate({
+          templateUrl: issueForm.imageUrl,
+          namePos: issueForm.namePos,
+          idPos: issueForm.idPos,
+          elements: issueForm.elements,
+          recipientName: r.name,
+          recipientEmail: r.email,
+          recipientPhone: r.phone,
+          description: issueForm.description,
+          customFields: issueForm.customFields,
+          // Files the new certificate into THIS folder (not "Manual /
+          // Other") and links it to the same webinar the folder is for.
+          ...(activeFolderWebinar ? {
+            webinarId: activeFolderWebinar.id,
+            webinarTitle: activeFolderWebinar.topic || activeFolderWebinar.title || '',
+          } : {}),
+        })
+        results.push({ ...r, success: true })
+      } catch (e) {
+        results.push({ ...r, success: false, error: e.message })
+      }
+      setIssueProgress(p => ({ ...p, done: p.done + 1 }))
+    }
+
+    // Only remembered as the generic "last used" template for the top-level
+    // Issue flow when this issuance WASN'T using a folder's own session
+    // template — otherwise one webinar's template would leak into the next
+    // unrelated manual issuance, which is exactly what per-folder isolation
+    // (point 3 of the request) rules out.
+    if (!activeFolderWebinar?.certTemplate?.imageUrl) {
+      const usedTemplate = {
+        imageUrl: issueForm.imageUrl,
+        namePos: issueForm.namePos,
+        idPos: issueForm.idPos,
+        customFields: issueForm.customFields.map(({ value, ...rest }) => rest),
+        elements: issueForm.elements,
+      }
+      setLastTemplate(usedTemplate)
+      settingsService.update({ lastManualCertTemplate: usedTemplate }).catch(() => {})
+    }
+
+    setIssueSaving(false)
+    setIssueProgress(null)
+
+    const failed = results.filter(r => !r.success)
+    if (failed.length === 0) {
+      alert(`Issued ${results.length} certificate${results.length > 1 ? 's' : ''} successfully.`)
+      closeIssue()
+    } else {
+      // Left open (not closed) so the admin can see which rows failed and
+      // fix/retry them — the succeeded ones are already issued either way.
+      alert(
+        `Issued ${results.length - failed.length} of ${results.length}.\n\nFailed:\n` +
+        failed.map(f => `• ${f.name} (${f.email}) — ${f.error}`).join('\n')
+      )
+    }
+  }
+
+  // Custom fields (Score, Grade, Duration, etc.) — fully optional, each gets
+  // its own draggable box on the template via CertPositionEditor.
+  const addCustomField = () => setIssueForm(p => ({
+    ...p,
+    customFields: [...p.customFields, { id: crypto.randomUUID(), label: '', value: '', xPct: 50, yPct: 50, fontSize: 28, color: '#1a1a1a', fontFamily: DEFAULT_CERT_FONT }],
+  }))
+  const removeCustomField = id => setIssueForm(p => ({ ...p, customFields: p.customFields.filter(f => f.id !== id) }))
+  const setCustomFieldText = (id, key) => e => setIssueForm(p => ({
+    ...p,
+    customFields: p.customFields.map(f => f.id === id ? { ...f, [key]: e.target.value } : f),
+  }))
+  const setCustomFieldPos = (id, patch) => setIssueForm(p => ({
+    ...p,
+    customFields: p.customFields.map(f => f.id === id ? { ...f, ...patch } : f),
+  }))
+
+  // when admin links a webinar/course, auto-fill the title
+  const onSourceChange = (type, id) => {
+    let title = form.title
+    if (type === 'webinar') title = webinars.find(w => w.id === id)?.topic || webinars.find(w => w.id === id)?.title || ''
+    if (type === 'course')  title = courses.find(c => c.id === id)?.title || ''
+    setForm(p => ({ ...p, sourceType: type, sourceId: id, title }))
+  }
+
+  // Metadata-only edit for legacy (pre-image-template) certificate records —
+  // recompositing an already-issued image-based certificate isn't supported
+  // here; those are edited by revoking and issuing a new one.
+  const handleSave = async () => {
+    if (!form.recipient.trim()) { alert('Recipient name is required'); return }
+    if (!form.title.trim())     { alert('Certificate title is required'); return }
+    setSaving(true)
+    try {
+      await certificatesService.update(editId, form)
+      closeModal()
+    } catch (e) { alert('Error: ' + e.message) }
+    finally { setSaving(false) }
+  }
+
+  const handleRevoke = async id => {
+    if (!confirm('Revoke this certificate? It will fail verification afterwards.')) return
+    try { await certificatesService.revoke(id) } catch (e) { alert('Error: ' + e.message) }
+  }
+
+  const handleVerify = async () => {
+    if (!verifyCode.trim()) return
+    setVerifying(true); setVerifyResult(null)
+    try {
+      const cert = await certificatesService.verify(verifyCode.trim())
+      setVerifyResult(cert ? { found: true, ...cert } : { found: false })
+    } catch { setVerifyResult({ found: false }) }
+    finally { setVerifying(false) }
+  }
+
+  const copyLink = code => {
+    const url = `${window.location.origin}/certificate/${code}`
+    navigator.clipboard?.writeText(url)
+    alert('Public certificate link copied:\n' + url)
+  }
+
+  // Print just the certificate (opens a clean print window → user picks "Save as PDF")
+  const printCert = (cert) => {
+    const w = window.open(`${window.location.origin}/certificate/${cert.certCode}?print=1`, '_blank')
+    if (!w) alert('Please allow popups to download the certificate.')
+  }
+
+  const columns = [
+    { key: 'certCode', label: 'Certificate ID', render: v => <span className="font-mono text-xs text-[#1655c3] font-bold">{v}</span> },
+    { key: 'recipient', label: 'Recipient', render: (v, row) => <span className="font-semibold text-[#1a1a1a]">{v || row.student}</span> },
+    { key: 'title', label: 'For', render: (v, row) => <span className="text-xs text-gray-600 max-w-[180px] truncate block">{v || row.course}</span> },
+    { key: 'sourceType', label: 'Source', render: v => (
+      <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${v === 'manual' ? 'bg-purple-50 text-purple-600' : v === 'webinar' ? 'bg-blue-50 text-[#1655c3]' : 'bg-gray-100 text-gray-500'}`}>
+        {v === 'manual' ? 'Manual' : v === 'webinar' ? 'Webinar' : v === 'course' ? 'Course' : '—'}
+      </span>
+    )},
+    { key: 'template', label: 'Design', render: (v, row) => row.certificateImageUrl
+      ? <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-green-50 text-[#64ac37]">Custom Template</span>
+      : <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-blue-50 text-[#1655c3]">{TEMPLATES.find(t => t.id === v)?.name || 'Classic'}</span>
+    },
+    { key: 'issued', label: 'Issued' },
+    { key: 'verifications', label: 'Verified', render: v => <span className="font-bold text-[#1655c3]">{v || 0}×</span> },
+    { key: 'status', label: 'Status', render: v => <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${v === 'Valid' ? 'bg-green-50 text-green-600' : 'bg-red-50 text-red-500'}`}>{v}</span> },
+    { key: 'id', label: 'Actions', render: (v, row) => (
+      <div className="flex gap-1.5">
+        <button onClick={() => setPreview(row)} className="p-1.5 rounded-lg hover:bg-blue-50 text-[#1655c3]" title="Preview"><Eye size={13} /></button>
+        <button onClick={() => copyLink(row.certCode)} className="p-1.5 rounded-lg hover:bg-blue-50 text-[#64ac37]" title="Copy public link"><Copy size={13} /></button>
+        <button onClick={() => printCert(row)} className="p-1.5 rounded-lg hover:bg-blue-50 text-[#1655c3]" title="Download / Print"><Download size={13} /></button>
+        <button onClick={() => openEdit(row)} className="p-1.5 rounded-lg hover:bg-blue-50 text-[#1655c3]" title="Edit"><Edit2 size={13} /></button>
+        {row.submissionId && (
+          <button onClick={() => setViewSubCert(row)} className="p-1.5 rounded-lg hover:bg-blue-50 text-[#1655c3]" title="View Submission"><FileText size={13} /></button>
+        )}
+        {row.status === 'Valid' && <button onClick={() => handleRevoke(v)} className="p-1.5 rounded-lg hover:bg-red-50 text-red-400" title="Revoke"><XCircle size={13} /></button>}
+      </div>
+    )},
+  ]
+
+  const valid    = data.filter(c => c.status === 'Valid').length
+  const revoked  = data.filter(c => c.status === 'Revoked').length
+  const totalVer = data.reduce((a, c) => a + (c.verifications || 0), 0)
+
+  return (
+    <div className="p-4 sm:p-6 space-y-6">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <StatCard icon={Award}       label="Total Certificates" value={loading ? '…' : data.length} color="#1655c3" bg="#eff6ff" />
+        <StatCard icon={CheckCircle} label="Valid"              value={loading ? '…' : valid}       color="#64ac37" bg="#f0fdf4" />
+        <StatCard icon={XCircle}     label="Revoked"            value={loading ? '…' : revoked}     color="#ef4444" bg="#fef2f2" />
+        <StatCard icon={Eye}         label="Verifications"      value={loading ? '…' : totalVer}    color="#1655c3" bg="#eff6ff" />
+      </div>
+
+      {/* Live verify tool */}
+      <div className="rounded-3xl p-6 relative overflow-hidden bg-[#1655c3]">
+        <div className="flex flex-col sm:flex-row items-center gap-4">
+          <div className="w-12 h-12 bg-white/20 rounded-2xl flex items-center justify-center shrink-0"><Award size={24} className="text-white" /></div>
+          <div className="text-white flex-1">
+            <div className="font-black text-lg">Certificate Verification</div>
+            <div className="text-white/70 text-sm">Enter a CERT-MW code to verify</div>
+          </div>
+          <div className="flex gap-2 w-full sm:w-auto">
+            <input type="text" placeholder="CERT-MW-2025-XXXXX" value={verifyCode}
+              onChange={e => { setVerifyCode(e.target.value); setVerifyResult(null) }}
+              onKeyDown={e => e.key === 'Enter' && handleVerify()}
+              className="flex-1 sm:w-64 px-4 py-2.5 rounded-xl bg-white text-gray-700 text-sm outline-none font-mono" />
+            <button onClick={handleVerify} disabled={verifying}
+              className="px-5 py-2.5 bg-white text-[#1655c3] font-bold rounded-xl text-sm hover:bg-gray-50 shrink-0 disabled:opacity-60">
+              {verifying ? '…' : 'Verify'}
+            </button>
+          </div>
+        </div>
+        {verifyResult && (
+          <div className={`mt-4 rounded-xl p-3 flex items-center gap-3 max-w-lg ${verifyResult.found ? 'bg-white/20' : 'bg-red-500/20'}`}>
+            {verifyResult.found ? <CheckCircle size={18} className="text-green-300" /> : <XCircle size={18} className="text-red-300" />}
+            <div className="text-white text-sm">
+              {verifyResult.found
+                ? <><span className="font-bold">✅ Valid</span> — {verifyResult.recipient || verifyResult.student} · {verifyResult.title || verifyResult.course}</>
+                : <span className="font-bold">❌ Certificate not found</span>}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {activeFolder ? (
+        <div className="space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <button onClick={() => setActiveFolderKey(null)} className="flex items-center gap-2 text-sm font-semibold text-gray-500 hover:text-[#1655c3] transition-colors w-fit">
+              <ArrowLeft size={16} /> All Folders
+            </button>
+            <div className="flex items-center gap-2">
+              <AdminButton variant="ghost" size="sm" onClick={() => exportFolderExcel(activeFolder)}>
+                <FileSpreadsheet size={14} className="mr-1.5" /> Export to Excel
+              </AdminButton>
+              <AdminButton variant="ghost" size="sm" onClick={() => exportFolderPdf(activeFolder)}>
+                <FileType size={14} className="mr-1.5" /> Export to PDF
+              </AdminButton>
+            </div>
+          </div>
+          <DataTable title={activeFolder.label} columns={columns} data={activeFolder.certs} searchKey="recipient"
+            emptyMessage="No certificates in this folder"
+            actions={<AdminButton size="sm" onClick={openIssue}>+ Issue Certificate</AdminButton>}
+          />
+        </div>
+      ) : (
+        <FolderGrid
+          title="Certificate Folders"
+          items={folders.map(f => ({
+            key: f.key, label: f.label,
+            sublabel: f.latestIssued ? `Latest: ${f.latestIssued}` : 'No issue date',
+            count: f.certs.length,
+          }))}
+          onOpen={setActiveFolderKey}
+          emptyMessage="No certificates yet — click Issue Certificate to create one"
+          actions={<AdminButton size="sm" onClick={openIssue}>+ Issue Certificate</AdminButton>}
+        />
+      )}
+
+      {/* EDIT MODAL (legacy design-picker records only) with live preview */}
+      {modal && (
+        <Modal title="Edit Certificate" onClose={closeModal} wide>
+          <div className="grid lg:grid-cols-2 gap-6">
+            {/* LEFT — form */}
+            <div className="space-y-4">
+              {/* Template picker */}
+              <div>
+                <label className="block text-xs font-semibold text-gray-600 mb-2">Certificate Design</label>
+                <div className="grid grid-cols-2 gap-2">
+                  {TEMPLATES.map(t => (
+                    <button key={t.id} onClick={() => setForm(p => ({ ...p, template: t.id }))}
+                      className={`text-xs font-bold px-3 py-2 rounded-xl border-2 transition-all ${form.template === t.id ? 'border-[#1655c3] text-[#1655c3] bg-blue-50' : 'border-gray-200 text-gray-500'}`}>
+                      {t.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <FormField label="Certificate Code">
+                <input className={`${inputCls} font-mono`} value={form.certCode} onChange={set('certCode')} />
+              </FormField>
+
+              <div className="grid grid-cols-2 gap-4">
+                <FormField label="Recipient Name">
+                  <input className={inputCls} value={form.recipient} onChange={set('recipient')} placeholder="Fatima Zahra" />
+                </FormField>
+                <FormField label="Recipient Email (optional)">
+                  <input className={inputCls} value={form.recipientEmail} onChange={set('recipientEmail')} placeholder="name@email.com" />
+                </FormField>
+              </div>
+
+              {/* Source link */}
+              <FormField label="Award for">
+                <select className={inputCls} value={form.sourceType} onChange={e => onSourceChange(e.target.value, '')}>
+                  <option value="manual">Custom title (type below)</option>
+                  <option value="webinar">A Webinar</option>
+                  <option value="course">A Course</option>
+                </select>
+              </FormField>
+              {form.sourceType === 'webinar' && (
+                <FormField label="Select Webinar">
+                  <select className={inputCls} value={form.sourceId} onChange={e => onSourceChange('webinar', e.target.value)}>
+                    <option value="">— choose —</option>
+                    {webinars.map(w => <option key={w.id} value={w.id}>{w.topic || w.title}</option>)}
+                  </select>
+                </FormField>
+              )}
+              {form.sourceType === 'course' && (
+                <FormField label="Select Course">
+                  <select className={inputCls} value={form.sourceId} onChange={e => onSourceChange('course', e.target.value)}>
+                    <option value="">— choose —</option>
+                    {courses.map(c => <option key={c.id} value={c.id}>{c.title}</option>)}
+                  </select>
+                </FormField>
+              )}
+
+              <FormField label="Certificate Title">
+                <input className={inputCls} value={form.title} onChange={set('title')} placeholder="Clinical Pharmacy Masterclass" />
+              </FormField>
+              <FormField label="Body / Description line">
+                <textarea rows={2} className={inputCls} value={form.body} onChange={set('body')} placeholder="has demonstrated outstanding commitment…" />
+              </FormField>
+              <div className="grid grid-cols-2 gap-4">
+                <FormField label="Signatory Name">
+                  <input className={inputCls} value={form.signatoryName} onChange={set('signatoryName')} />
+                </FormField>
+                <FormField label="Signatory Title">
+                  <input className={inputCls} value={form.signatoryTitle} onChange={set('signatoryTitle')} />
+                </FormField>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <FormField label="Issue Date">
+                  <input className={inputCls} type="date" value={form.issued} onChange={set('issued')} />
+                </FormField>
+                <FormField label="Status">
+                  <select className={inputCls} value={form.status} onChange={set('status')}>
+                    <option>Valid</option><option>Revoked</option>
+                  </select>
+                </FormField>
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <AdminButton variant="ghost" className="flex-1" onClick={closeModal}>Cancel</AdminButton>
+                <AdminButton variant="primary" className="flex-1" onClick={handleSave} disabled={saving}>
+                  {saving ? 'Saving…' : 'Save'}
+                </AdminButton>
+              </div>
+            </div>
+
+            {/* RIGHT — live preview */}
+            <div className="lg:sticky lg:top-0">
+              <label className="block text-xs font-semibold text-gray-600 mb-2">Live Preview</label>
+              <div className="rounded-xl border border-gray-100 bg-gray-50 p-3 overflow-auto flex justify-center">
+                <PreviewBox form={form} scale={0.42} />
+              </div>
+              <p className="text-[11px] text-gray-400 mt-2">The recipient can view & download this at <span className="font-mono">/certificate/{form.certCode}</span></p>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {/* MANUAL "ISSUE CERTIFICATE" MODAL — rebuilt to match the automatic
+          webinar-feedback flow exactly: template image upload + the same
+          drag-to-position editor (with its built-in font picker, including
+          Alex Brush) used in Admin > Webinars > Certificate Template. On
+          submit this calls issueManualCertificate() in
+          src/lib/certificateGenerator.js — the SAME composite/upload/
+          record/email pipeline the automatic flow uses, not a second
+          copy of it. */}
+      {issueModal && (
+        <Modal title="Issue Certificate" onClose={closeIssue} wide>
+          <div className="space-y-4">
+            {activeFolderWebinar && (
+              <div className="rounded-xl bg-blue-50 border border-blue-100 px-4 py-3 text-xs text-[#1655c3] font-semibold flex items-center gap-2">
+                <Folder size={14} className="shrink-0" />
+                {activeFolderWebinar.certTemplate?.imageUrl
+                  ? <>Pre-filled with <b>{activeFolderWebinar.topic || activeFolderWebinar.title}</b>'s own certificate template — just add recipients below.</>
+                  : <>No certificate template is configured yet for <b>{activeFolderWebinar.topic || activeFolderWebinar.title}</b> (Admin → Webinars → Certificate Template) — using the default template for now.</>}
+              </div>
+            )}
+            <div className="rounded-xl border border-gray-200 p-4 space-y-3">
+              <p className="text-xs font-bold text-gray-600 uppercase tracking-wider">Certificate Template</p>
+              <ImageUpload
+                label="Certificate Template Image"
+                folder="medweb/certificates/templates"
+                value={issueForm.imageUrl}
+                onChange={v => setIssueForm(p => ({ ...p, imageUrl: v }))}
+              />
+              {issueForm.imageUrl && (
+                <CertPositionEditor
+                  imageUrl={issueForm.imageUrl}
+                  namePos={issueForm.namePos}
+                  idPos={issueForm.idPos}
+                  onChange={({ namePos, idPos }) => setIssueForm(p => ({ ...p, namePos, idPos }))}
+                  customFields={issueForm.customFields}
+                  onChangeCustomField={setCustomFieldPos}
+                  elements={issueForm.elements}
+                  onChangeElements={els => setIssueForm(p => ({ ...p, elements: els }))}
+                  nameSampleText={activeRecipientName}
+                />
+              )}
+            </div>
+
+            <div className="rounded-xl border border-gray-200 p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-bold text-gray-600 uppercase tracking-wider">Recipients</p>
+                <button type="button" onClick={addRecipient} className="flex items-center gap-1 text-xs font-semibold px-3 py-1.5 rounded-lg border border-dashed border-[#1655c3]/40 text-[#1655c3] hover:bg-blue-50">
+                  <Plus size={13} /> Add Recipient
+                </button>
+              </div>
+              <div className="space-y-2">
+                {issueForm.recipients.map(r => (
+                  <div key={r.id} className="flex gap-2 items-center">
+                    <input className={`${inputCls} flex-1`} value={r.name} onChange={setRecipientField(r.id, 'name')} onFocus={() => setFocusedRecipientId(r.id)} placeholder="Recipient Name" />
+                    <input className={`${inputCls} flex-1`} type="email" value={r.email} onChange={setRecipientField(r.id, 'email')} placeholder="name@email.com" />
+                    <input className={`${inputCls} flex-1`} value={r.phone} onChange={setRecipientField(r.id, 'phone')} placeholder="03XX-XXXXXXX" />
+                    {issueForm.recipients.length > 1 && (
+                      <button onClick={() => removeRecipient(r.id)} className="p-2 rounded-lg hover:bg-red-50 text-red-400 flex-shrink-0"><X size={16} /></button>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <p className="text-[11px] text-gray-400">Every recipient gets their own certificate ID, image, and email — the description and custom fields below are shared across the whole batch.</p>
+            </div>
+
+            <FormField label="Description (the reason / course / achievement — shared by every recipient above)">
+              <textarea rows={2} className={inputCls} value={issueForm.description} onChange={setIssueField('description')}
+                placeholder="e.g. For successfully completing the Clinical Pharmacy Masterclass" />
+            </FormField>
+
+            <div className="rounded-xl border border-gray-200 p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-bold text-gray-600 uppercase tracking-wider">Custom Fields (optional)</p>
+                <button type="button" onClick={addCustomField} className="flex items-center gap-1 text-xs font-semibold px-3 py-1.5 rounded-lg border border-dashed border-[#a855f7]/50 text-[#a855f7] hover:bg-purple-50">
+                  <Plus size={13} /> Add Custom Field
+                </button>
+              </div>
+              {issueForm.customFields.length === 0 ? (
+                <p className="text-[11px] text-gray-400">Add extra fields like Score, Grade, or Duration — each gets its own draggable position on the template above.</p>
+              ) : (
+                <div className="space-y-2">
+                  {issueForm.customFields.map(f => (
+                    <div key={f.id} className="flex gap-2 items-center">
+                      <input className={`${inputCls} flex-1`} value={f.label} onChange={setCustomFieldText(f.id, 'label')} placeholder="Field Label (e.g. Score)" />
+                      <input className={`${inputCls} flex-1`} value={f.value} onChange={setCustomFieldText(f.id, 'value')} placeholder="Field Value (e.g. 95/100)" />
+                      <button onClick={() => removeCustomField(f.id)} className="p-2 rounded-lg hover:bg-red-50 text-red-400 flex-shrink-0"><X size={16} /></button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <p className="text-[11px] text-gray-400">
+              Each recipient gets their own automatically-generated Certificate ID (same MEDWEB-XXXXXXXXXX system used for auto-issued certificates), composited onto the template above, uploaded, and emailed to them immediately on save.
+            </p>
+
+            {issueProgress && (
+              <div className="rounded-xl bg-blue-50 border border-blue-100 px-4 py-2.5 text-xs font-bold text-[#1655c3]">
+                Issuing {issueProgress.done + 1} of {issueProgress.total}…
+              </div>
+            )}
+
+            <div className="flex gap-3 pt-2">
+              <AdminButton variant="ghost" className="flex-1" onClick={closeIssue} disabled={issueSaving}>Cancel</AdminButton>
+              <AdminButton variant="primary" className="flex-1" onClick={handleIssueSave} disabled={issueSaving || !issueForm.imageUrl}>
+                {issueSaving
+                  ? `Issuing ${Math.min((issueProgress?.done ?? 0) + 1, issueProgress?.total ?? 1)}/${issueProgress?.total ?? ''}…`
+                  : issueForm.recipients.filter(r => r.name.trim() && r.email.trim()).length > 1
+                  ? `Issue ${issueForm.recipients.filter(r => r.name.trim() && r.email.trim()).length} Certificates`
+                  : 'Issue Certificate'}
+              </AdminButton>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {/* FULL PREVIEW MODAL */}
+      {preview && (
+        <Modal title={`Certificate — ${preview.recipient || preview.student}`} onClose={() => setPreview(null)} wide>
+          <div className="space-y-4">
+            <div className="overflow-auto flex justify-center bg-gray-50 rounded-xl p-4">
+              <PreviewBox form={preview} scale={0.62} />
+            </div>
+            <div className="flex flex-wrap gap-3 justify-center">
+              <button onClick={() => copyLink(preview.certCode)} className="flex items-center gap-1.5 text-sm font-bold text-[#1655c3] border-2 border-[#1655c3] px-4 py-2 rounded-xl hover:bg-blue-50">
+                <Copy size={14} /> Copy Public Link
+              </button>
+              <a href={`/certificate/${preview.certCode}`} target="_blank" rel="noreferrer" className="flex items-center gap-1.5 text-sm font-bold text-[#64ac37] border-2 border-[#64ac37] px-4 py-2 rounded-xl hover:bg-green-50">
+                <ExternalLink size={14} /> Open Page
+              </a>
+              <AdminButton onClick={() => printCert(preview)}>
+                <Download size={14} className="mr-1.5" /> Download / Print
+              </AdminButton>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {/* VIEW SUBMISSION — the full feedback-form answers behind an auto-issued certificate */}
+      {viewSubCert && (
+        viewSubData
+          ? <ResponsesModal form={viewSubData.parentForm} subs={[viewSubData.sub]} onClose={() => setViewSubCert(null)} />
+          : <Modal title="Submission" onClose={() => setViewSubCert(null)}>
+              <p className="text-sm text-gray-400 text-center py-6">This submission is no longer available (it may have been deleted).</p>
+            </Modal>
+      )}
+    </div>
+  )
+}

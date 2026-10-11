@@ -1,0 +1,265 @@
+// Client-side certificate generation — runs entirely in the submitting
+// student's own browser, triggered right after a webinar feedback form
+// submission succeeds (see src/pages/DynamicForm.jsx). Replaces the old
+// Cloud Function version (functions/index.js's onFeedbackSubmission,
+// left in place unused) since Cloud Functions require the Blaze plan.
+//
+// Position/style conventions (namePos/idPos: {xPct, yPct, fontSize, color})
+// must match src/admin/components/CertPositionEditor.jsx exactly — the name
+// box is centered on its point (canvas textAlign 'center'), the ID box is
+// left-anchored at its point (textAlign 'left'), same as the admin preview.
+
+import { certificatesService, formsService, studentsDbService } from '../firebase/services'
+import { uploadToCloudinary } from '../firebase/cloudinary'
+import { sendCertificateEmail } from '../firebase/email'
+import { DEFAULT_CERT_FONT } from '../constants/certificateFonts'
+import { drawTextField } from './certFontFit'
+import { drawElement } from './certElements'
+
+const DEFAULT_NAME_POS = { xPct: 50, yPct: 28, fontSize: 48, color: '#1a1a1a', fontFamily: DEFAULT_CERT_FONT }
+const DEFAULT_ID_POS   = { xPct: 10, yPct: 90, fontSize: 26, color: '#1a1a1a' }
+
+function toTitleCase(str) {
+  return String(str).trim().toLowerCase().replace(/\b\w/g, c => c.toUpperCase())
+}
+
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous' // Cloudinary serves public CORS headers — needed to export the canvas afterward
+    img.onload = () => resolve(img)
+    img.onerror = () => reject(new Error('Failed to load the certificate template image'))
+    img.src = url
+  })
+}
+
+async function compositeCertificateCanvas({ templateUrl, studentName, certCode, namePos, idPos, customFields, elements }) {
+  const img = await loadImage(templateUrl)
+  const canvas = document.createElement('canvas')
+  canvas.width = img.naturalWidth
+  canvas.height = img.naturalHeight
+  const ctx = canvas.getContext('2d')
+  ctx.drawImage(img, 0, 0)
+
+  // Decorative shapes/icons draw first — a divider line or seal sits behind
+  // the text layer, same stacking order as the live preview canvas.
+  // drawElement() is the SAME function CertPositionEditor.jsx's preview
+  // canvas calls, so a shape's position/size/color match exactly.
+  for (const el of elements || []) {
+    drawElement(ctx, el, canvas.width, canvas.height)
+  }
+
+  const name = { ...DEFAULT_NAME_POS, ...(namePos || {}) }
+  const id = { ...DEFAULT_ID_POS, ...(idPos || {}) }
+
+  // drawTextField() is the SAME function CertPositionEditor.jsx's live
+  // preview canvas calls — same box-resolution, auto-shrink and draw code,
+  // so what the admin saw while positioning is exactly what lands here.
+  await drawTextField(ctx, studentName, name, canvas.width, canvas.height, {
+    centered: true,
+    widthFactor: 12,
+  })
+
+  const idText = `ID: ${certCode}`
+  await drawTextField(ctx, idText, id, canvas.width, canvas.height, {
+    centered: false,
+    fontFamily: 'Helvetica, Arial, sans-serif',
+    widthFactor: 10,
+  })
+
+  // Optional dynamic fields (manual "Issue Certificate" flow only — the
+  // automatic webinar flow never passes these). Centered on their point,
+  // same convention as the Name box.
+  for (const field of customFields || []) {
+    const value = field.value?.trim()
+    if (!value) continue
+    await drawTextField(ctx, value, { ...field, fontSize: field.fontSize || 28, color: field.color || '#1a1a1a' }, canvas.width, canvas.height, {
+      centered: true,
+      widthFactor: 12,
+    })
+  }
+
+  return canvas
+}
+
+// Steps JPEG quality down until the file is comfortably under EmailJS's
+// 500KB attachment ceiling — a certificate doesn't need to be huge, so this
+// targets ~350KB to leave headroom.
+function canvasToCompressedBlob(canvas, targetBytes = 350 * 1024) {
+  return new Promise((resolve, reject) => {
+    const tryQuality = quality => {
+      canvas.toBlob(blob => {
+        if (!blob) { reject(new Error('Canvas export failed')); return }
+        if (blob.size <= targetBytes || quality <= 0.35) resolve(blob)
+        else tryQuality(quality - 0.15)
+      }, 'image/jpeg', quality)
+    }
+    tryQuality(0.85)
+  })
+}
+
+/**
+ * Shared core: composite → compress → upload → save the certificates
+ * record → enrich the Student Database → email the recipient. Every
+ * certificate-issuing entry point in the app (the automatic
+ * webinar-feedback flow below, and the admin's manual "Issue Certificate"
+ * flow in AdminCertificates.jsx) funnels through this single
+ * implementation — nothing about the compositing/upload/email pipeline is
+ * duplicated between them, only how each entry point resolves its inputs
+ * and reports success/failure differs.
+ *
+ * Throws on failure (network, canvas, upload, etc.) — callers decide how
+ * to surface that: the webinar flow records it on the submission doc, the
+ * manual admin flow shows an alert.
+ */
+async function compositeAndIssueCertificate({
+  templateUrl, namePos, idPos, rawName, email: rawEmail, phone: rawPhone, title, body, sourceType, extra, customFields, elements,
+}) {
+  const studentName = toTitleCase(rawName)
+  // Normalized once here so the stored certificate doc's `email` always
+  // matches studentsDbService's own lowercased key — otherwise
+  // certificatesService.getByEmail() (PortfolioPage.jsx) silently misses
+  // certificates whenever a visitor typed their email in mixed case.
+  const email = String(rawEmail || '').trim().toLowerCase()
+  // Phone is the actual student-identity key now (see upsertStudent in
+  // services.js — names collide across students, email isn't always
+  // captured consistently, but every registration/feedback flow collects
+  // a phone number). Stored on the certificate doc itself so
+  // certificatesService.getByPhone() (PortfolioPage.jsx) can find it
+  // without going through email at all.
+  const phone = String(rawPhone || '').trim()
+
+  const certCode = await certificatesService.generateUniqueCode()
+
+  const canvas = await compositeCertificateCanvas({
+    templateUrl, studentName, certCode, namePos, idPos, customFields, elements,
+  })
+  const blob = await canvasToCompressedBlob(canvas)
+  const certificateImageUrl = await uploadToCloudinary(blob, 'medweb/certificates/generated')
+
+  // Field names match the schema the old Cloud Function wrote (and what
+  // the public Certificate Verification page / admin Certificates table
+  // already read), so nothing downstream needs to change. `customFields`
+  // is new and additive — a record with none (every pre-existing
+  // certificate, and every automatic webinar-flow one) simply omits it.
+  await certificatesService.add({
+    certCode,
+    recipient: studentName,
+    recipientEmail: email,
+    title,
+    sourceType,
+    body,
+    issued: new Date().toISOString().split('T')[0],
+    studentName,
+    email,
+    phone,
+    certificateImageUrl,
+    issuedAt: new Date().toISOString(),
+    ...(customFields?.length ? { customFields } : {}),
+    ...extra,
+  })
+
+  studentsDbService.upsertFromCertificate({
+    email, phone, name: studentName, webinarId: extra?.webinarId, webinarTitle: title, certCode,
+    issuedAt: new Date().toISOString(),
+  }).catch(err => console.error('studentsDbService.upsertFromCertificate failed:', err))
+
+  const emailResult = await sendCertificateEmail({ name: studentName, email, certCode, webinarTitle: title, certificateImageUrl })
+
+  return { certCode, certificateImageUrl, studentName, emailResult }
+}
+
+/**
+ * Silently does nothing if the webinar has no certTemplate configured.
+ * Never throws into the caller — the feedback form's own success message
+ * must not depend on this. Failures are recorded on the submission doc
+ * (certificateStatus/certificateError) for an admin to notice later, not
+ * surfaced to the student mid-form.
+ */
+export async function generateAndIssueCertificate({ submissionId, webinar, rawName, email, phone }) {
+  const certTemplate = webinar.certTemplate
+  if (!certTemplate?.imageUrl) return // no template configured — skip entirely, by design
+
+  const markStatus = data => formsService.updateSubmission(submissionId, data).catch(() => {})
+
+  if (!rawName?.trim() || !email?.trim()) {
+    console.error(`Certificate skipped for submission ${submissionId}: missing name or email`)
+    await markStatus({ certificateStatus: 'failed', certificateError: 'Missing name or email in submission' })
+    return
+  }
+
+  const webinarTitle = webinar.topic || webinar.title || ''
+
+  try {
+    const { certCode, emailResult } = await compositeAndIssueCertificate({
+      templateUrl: certTemplate.imageUrl,
+      namePos: certTemplate.namePos,
+      idPos: certTemplate.idPos,
+      elements: certTemplate.elements,
+      rawName,
+      email,
+      phone,
+      title: webinarTitle,
+      body: 'has successfully attended and submitted feedback for this webinar.',
+      sourceType: 'webinar',
+      extra: { sourceId: webinar.id, webinarId: webinar.id, webinarTitle, submissionId },
+    })
+
+    await markStatus({ certificateStatus: 'issued', certCode })
+
+    if (emailResult?.skipped) {
+      // Not a failure — EmailJS just isn't configured/enabled yet. Distinct
+      // status so this doesn't read the same as a real send failure, but
+      // still surfaced (previously: sent===false was the only checked case,
+      // so a skipped send left no trace anywhere).
+      console.error(`Certificate email skipped for submission ${submissionId}: ${emailResult.reason}`)
+      await markStatus({ certificateStatus: 'issued_email_skipped', certificateEmailError: emailResult.reason })
+    } else if (emailResult?.sent === false) {
+      console.error(`Certificate email failed for submission ${submissionId}:`, emailResult.error)
+      await markStatus({ certificateStatus: 'issued_email_failed', certificateEmailError: emailResult.error })
+    }
+  } catch (err) {
+    console.error(`Certificate generation failed for submission ${submissionId}:`, err)
+    await markStatus({ certificateStatus: 'failed', certificateError: err.message })
+  }
+}
+
+/**
+ * Manual admin-issued certificate — Admin > Certificates > "Issue
+ * Certificate". Same compositing/upload/record/email pipeline as the
+ * automatic webinar-feedback flow above (via the shared
+ * compositeAndIssueCertificate core), just triggered directly from a form
+ * submit instead of a feedback-form event. Unlike the webinar flow, this
+ * throws on failure — there's no submission doc to silently record the
+ * error on, so the admin UI needs a real exception to show.
+ */
+export async function issueManualCertificate({ templateUrl, namePos, idPos, elements, recipientName, recipientEmail, recipientPhone, description, customFields, webinarId, webinarTitle }) {
+  if (!templateUrl) throw new Error('A certificate template image is required')
+  if (!recipientName?.trim()) throw new Error('Recipient name is required')
+  if (!recipientEmail?.trim()) throw new Error('Recipient email is required')
+
+  const body = description?.trim() || 'has demonstrated outstanding commitment to medical excellence.'
+
+  return compositeAndIssueCertificate({
+    templateUrl,
+    namePos,
+    idPos,
+    elements,
+    rawName: recipientName,
+    email: recipientEmail,
+    phone: recipientPhone,
+    title: body,
+    body,
+    // When issued from inside a webinar's own Certificates folder
+    // (AdminCertificates.jsx), tag the record the same way the automatic
+    // webinar-feedback flow does (sourceType 'webinar' + webinarId) so it
+    // files into that same folder afterward instead of "Manual / Other".
+    // Plain top-level issuance (no folder) keeps the old 'manual' shape.
+    sourceType: webinarId ? 'webinar' : 'manual',
+    extra: webinarId ? { sourceId: webinarId, webinarId, webinarTitle: webinarTitle || '' } : {},
+    // Blank rows (no label typed yet) are dropped here rather than upstream
+    // so the admin UI can freely have an in-progress empty row without it
+    // ever reaching the canvas or the saved record.
+    customFields: (customFields || []).filter(f => f.label?.trim()),
+  })
+}
